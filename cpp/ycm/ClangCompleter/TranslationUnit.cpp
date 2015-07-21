@@ -67,7 +67,8 @@ remove_pointer< CXCodeCompleteResults >::type > CodeCompleteResultsWrap;
 
 TranslationUnit::TranslationUnit()
   : filename_( "" ),
-    clang_translation_unit_( NULL ) {
+    clang_translation_unit_( NULL ),
+    clang_index_( NULL ) {
 }
 
 TranslationUnit::TranslationUnit(
@@ -76,7 +77,8 @@ TranslationUnit::TranslationUnit(
   const std::vector< std::string > &flags,
   CXIndex clang_index )
   : filename_( filename ),
-    clang_translation_unit_( NULL ) {
+    clang_translation_unit_( NULL ),
+    clang_index_( clang_index ) {
   std::vector< const char * > pointer_flags;
   pointer_flags.reserve( flags.size() );
 
@@ -113,6 +115,8 @@ TranslationUnit::~TranslationUnit() {
 
 void TranslationUnit::Destroy() {
   unique_lock< mutex > lock( clang_access_mutex_ );
+
+  usrs_.clear();
 
   if ( clang_translation_unit_ ) {
     clang_disposeTranslationUnit( clang_translation_unit_ );
@@ -261,6 +265,35 @@ Location TranslationUnit::GetDefinitionLocation(
   return Location( clang_getCursorLocation( definition_cursor ) );
 }
 
+std::string TranslationUnit::GetDefinitionUSR( int line, int column ) {
+  unique_lock< mutex > lock( clang_access_mutex_ );
+
+  if ( !clang_translation_unit_ )
+    return std::string();
+
+  CXCursor cursor = GetCursor( line, column );
+
+  if ( !CursorIsValid( cursor ) )
+    return std::string();
+
+  CXCursor referenced_cursor = clang_getCursorReferenced( cursor );
+
+  if ( !CursorIsValid( referenced_cursor ) )
+    return std::string();
+
+  return CXStringToString( clang_getCursorUSR( referenced_cursor ) );
+}
+
+Location TranslationUnit::GetLocationForUSR( const std::string& usr ) const {
+  unique_lock< mutex > lock( usrs_mutex_ );
+  USRs::const_iterator it = usrs_.find( usr );
+
+  if ( it == usrs_.end() )
+    return Location();
+
+  return it->second;
+}
+
 std::string TranslationUnit::GetTypeAtLocation(
   int line,
   int column,
@@ -360,6 +393,19 @@ void TranslationUnit::Reparse(
   Reparse( unsaved_files, options );
 }
 
+void TranslationUnit::IndexerDeclarationCallback( CXClientData rawData, const CXIdxDeclInfo* decl ) {
+  if ( decl->entityInfo->kind == CXIdxEntity_CXXNamespace )
+    return;
+
+  if ( !clang_Location_isFromMainFile(clang_indexLoc_getCXSourceLocation( decl->loc ) ) )
+    return;
+
+  if ( !decl->isDefinition )
+    return;
+
+  USRs* usrs = static_cast<USRs*>( rawData );
+  (*usrs)[decl->entityInfo->USR] = Location( clang_indexLoc_getCXSourceLocation( decl->loc ) );
+};
 
 // Argument taken as non-const ref because we need to be able to pass a
 // non-const pointer to clang. This function (and clang too) will not modify the
@@ -388,6 +434,28 @@ void TranslationUnit::Reparse( std::vector< CXUnsavedFile > &unsaved_files,
   }
 
   UpdateLatestDiagnostics();
+
+  USRs usrsLocal;
+  {
+    unique_lock< mutex > lock( clang_access_mutex_ );
+    IndexerCallbacks callbacks = IndexerCallbacks();
+    callbacks.indexDeclaration = IndexerDeclarationCallback;
+
+    CXIndexAction action = clang_IndexAction_create( clang_index_ );
+    clang_indexTranslationUnit( action,
+                                &usrsLocal,
+                                &callbacks,
+                                sizeof(callbacks),
+                                CXIndexOpt_SuppressWarnings | CXIndexOpt_SkipParsedBodiesInSession,
+                                clang_translation_unit_);
+
+    clang_IndexAction_dispose( action );
+  }
+
+  {
+      unique_lock< mutex > lock( usrs_mutex_ );
+      usrsLocal.swap( usrs_ );
+  }
 }
 
 void TranslationUnit::UpdateLatestDiagnostics() {
